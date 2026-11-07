@@ -17,7 +17,8 @@ type item struct {
 	exp time.Time
 }
 
-var kv map[string]item
+var itemkv map[string]item
+var listkv map[string][]string
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -30,7 +31,8 @@ func main() {
 	}
 	defer l.Close()
 
-	kv = make(map[string]item)
+	itemkv = make(map[string]item)
+	listkv = make(map[string][]string)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -63,6 +65,9 @@ func BuildBulkString(str string) BulkString {
 }
 
 func (s BulkString) String() string {
+	if s.str == "" {
+		return "$-1\r\n"
+	}
 	return fmt.Sprintf("$%d\r\n%s\r\n", s.len, s.str)
 }
 
@@ -157,6 +162,45 @@ func processCommands(conn net.Conn, cmds []BulkString) {
 		handleSetCMD(conn, cmds[1].str, cmds[2].str, nil)
 	case "GET":
 		handleGetCMD(conn, cmds[1].str)
+	case "RPUSH":
+		vals := make([]string, 0, len(cmds)-2)
+		for i := 2; i < len(cmds); i++ {
+			vals = append(vals, cmds[i].str)
+		}
+		handleRPushCMD(conn, cmds[1].str, vals)
+	case "LRANGE":
+		startIdx, err := strconv.Atoi(cmds[2].str)
+		if err != nil {
+			fmt.Printf("Failed parsing start index for LRANGE cmd: %s\n", err.Error())
+			break
+		}
+		stopIdx, err := strconv.Atoi(cmds[3].str)
+		if err != nil {
+			fmt.Printf("Failed parsing stop index for LRANGE cmd: %s\n", err.Error())
+			break
+		}
+
+		handleLRangeCMD(conn, cmds[1].str, startIdx, stopIdx)
+	case "LPUSH":
+		vals := make([]string, 0, len(cmds)-2)
+		for i := 2; i < len(cmds); i++ {
+			vals = append(vals, cmds[i].str)
+		}
+
+		handleLPushCMD(conn, cmds[1].str, vals)
+	case "LLEN":
+		handleLLenCMD(conn, cmds[1].str)
+	case "LPOP":
+		if len(cmds) == 3 {
+			count, err := strconv.Atoi(cmds[2].str)
+			if err != nil {
+				fmt.Printf("Failed parsing count for LPOP cmd: %s\n", err.Error())
+				break
+			}
+			handleLPopCMD(conn, cmds[1].str, count)
+			return
+		}
+		handleLPopCMD(conn, cmds[1].str)
 	}
 }
 
@@ -170,29 +214,154 @@ func handleEchoCMD(conn net.Conn, msg string) {
 
 func handleSetCMD(conn net.Conn, key string, val string, exp *int) {
 	if exp != nil {
-		kv[key] = item{
+		itemkv[key] = item{
 			val: val,
 			exp: time.Now().Add(time.Millisecond * time.Duration(*exp)),
 		}
 	} else {
-		kv[key] = item{val: val}
+		itemkv[key] = item{val: val}
 	}
 
 	conn.Write([]byte("+OK\r\n"))
 }
 
 func handleGetCMD(conn net.Conn, key string) {
-	item, ok := kv[key]
+	item, ok := itemkv[key]
 	if !ok {
 		conn.Write([]byte("$-1\r\n"))
 		return
 	}
 
 	if !item.exp.IsZero() && time.Now().After(item.exp) {
-		delete(kv, key)
+		delete(itemkv, key)
 		conn.Write([]byte("$-1\r\n"))
 		return
 	}
 
 	conn.Write([]byte(BuildBulkString(item.val).String()))
+}
+
+func handleRPushCMD(conn net.Conn, key string, vals []string) {
+	list, ok := listkv[key]
+	if !ok {
+		list = make([]string, 0, 1)
+	}
+
+	for i := range vals {
+		list = append(list, vals[i])
+	}
+
+	listkv[key] = list
+
+	writeInteger(conn, len(list))
+}
+
+func writeInteger(conn net.Conn, num int) {
+	fmt.Fprintf(conn, ":%d\r\n", num)
+}
+
+func handleLRangeCMD(conn net.Conn, key string, startIdx int, stopIdx int) {
+	list, ok := listkv[key]
+	if !ok {
+		writeArray(conn, nil)
+		return
+	}
+
+	if startIdx < 0 {
+		startIdx = len(list) + startIdx
+	}
+	if stopIdx < 0 {
+		stopIdx = len(list) + stopIdx
+	}
+
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if stopIdx < 0 {
+		stopIdx = 0
+	}
+
+	if startIdx >= len(list) || startIdx > stopIdx {
+		writeArray(conn, nil)
+		return
+	}
+	if stopIdx >= len(list) {
+		stopIdx = len(list) - 1
+	}
+
+	writeArray(conn, list[startIdx:stopIdx+1])
+}
+
+func writeArray(conn net.Conn, arr []string) {
+	var resp strings.Builder
+	resp.WriteString(fmt.Sprintf("*%d\r\n", len(arr)))
+
+	for i := range arr {
+		resp.WriteString(BuildBulkString(arr[i]).String())
+	}
+
+	conn.Write([]byte(resp.String()))
+}
+
+func handleLPushCMD(conn net.Conn, key string, vals []string) {
+	list, ok := listkv[key]
+	if !ok {
+		list = make([]string, 0, 1)
+	}
+
+	for i := range vals {
+		temp := []string{vals[i]}
+		temp = appendList(temp, list)
+		list = temp
+	}
+
+	listkv[key] = list
+
+	writeInteger(conn, len(list))
+}
+
+func appendList(a, b []string) []string {
+	for i := range b {
+		a = append(a, b[i])
+	}
+	return a
+}
+
+func handleLLenCMD(conn net.Conn, key string) {
+	list, ok := listkv[key]
+	if !ok {
+		writeInteger(conn, 0)
+		return
+	}
+
+	writeInteger(conn, len(list))
+}
+
+func handleLPopCMD(conn net.Conn, key string, count ...int) {
+	list, ok := listkv[key]
+	if !ok {
+		conn.Write([]byte(BuildBulkString("").String()))
+		return
+	}
+	if count == nil {
+		a := list[0]
+
+		listkv[key] = list[1:]
+
+		conn.Write([]byte(BuildBulkString(a).String()))
+		return
+	}
+
+	if count[0] > len(list) {
+		count[0] = len(list)
+	}
+
+	elems := make([]string, 0, count[0])
+	for i := 0; i < count[0]; i++ {
+		elems = append(elems, list[i])
+	}
+
+	listkv[key] = list[count[0]:]
+
+	writeArray(conn, elems)
 }
