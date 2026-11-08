@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,8 +19,16 @@ type item struct {
 	exp time.Time
 }
 
+type listItem struct {
+	val  string
+	list string
+}
+
 var itemkv map[string]item
+
 var listkv map[string][]string
+var itemInsertedChan chan listItem
+var listkvMu sync.Mutex
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -32,6 +42,7 @@ func main() {
 	defer l.Close()
 
 	itemkv = make(map[string]item)
+	itemInsertedChan = make(chan listItem, 1)
 	listkv = make(map[string][]string)
 	for {
 		conn, err := l.Accept()
@@ -201,6 +212,13 @@ func processCommands(conn net.Conn, cmds []BulkString) {
 			return
 		}
 		handleLPopCMD(conn, cmds[1].str)
+	case "BLPOP":
+		timeout, err := strconv.Atoi(cmds[2].str)
+		if err != nil {
+			fmt.Printf("Failed parsing timeout for BLPOP cmd: %s\n", err.Error())
+			break
+		}
+		handleBLPopCMD(conn, cmds[1].str, timeout)
 	}
 }
 
@@ -242,7 +260,9 @@ func handleGetCMD(conn net.Conn, key string) {
 }
 
 func handleRPushCMD(conn net.Conn, key string, vals []string) {
+	listkvMu.Lock()
 	list, ok := listkv[key]
+	listkvMu.Unlock()
 	if !ok {
 		list = make([]string, 0, 1)
 	}
@@ -251,7 +271,10 @@ func handleRPushCMD(conn net.Conn, key string, vals []string) {
 		list = append(list, vals[i])
 	}
 
+	listkvMu.Lock()
 	listkv[key] = list
+	itemInsertedChan <- listItem{val: list[0], list: key}
+	listkvMu.Unlock()
 
 	writeInteger(conn, len(list))
 }
@@ -261,7 +284,9 @@ func writeInteger(conn net.Conn, num int) {
 }
 
 func handleLRangeCMD(conn net.Conn, key string, startIdx int, stopIdx int) {
+	listkvMu.Lock()
 	list, ok := listkv[key]
+	listkvMu.Unlock()
 	if !ok {
 		writeArray(conn, nil)
 		return
@@ -304,7 +329,9 @@ func writeArray(conn net.Conn, arr []string) {
 }
 
 func handleLPushCMD(conn net.Conn, key string, vals []string) {
+	listkvMu.Lock()
 	list, ok := listkv[key]
+	listkvMu.Unlock()
 	if !ok {
 		list = make([]string, 0, 1)
 	}
@@ -315,7 +342,10 @@ func handleLPushCMD(conn net.Conn, key string, vals []string) {
 		list = temp
 	}
 
+	listkvMu.Lock()
 	listkv[key] = list
+	itemInsertedChan <- listItem{val: list[0], list: key}
+	listkvMu.Unlock()
 
 	writeInteger(conn, len(list))
 }
@@ -328,7 +358,9 @@ func appendList(a, b []string) []string {
 }
 
 func handleLLenCMD(conn net.Conn, key string) {
+	listkvMu.Lock()
 	list, ok := listkv[key]
+	listkvMu.Unlock()
 	if !ok {
 		writeInteger(conn, 0)
 		return
@@ -338,7 +370,9 @@ func handleLLenCMD(conn net.Conn, key string) {
 }
 
 func handleLPopCMD(conn net.Conn, key string, count ...int) {
+	listkvMu.Lock()
 	list, ok := listkv[key]
+	listkvMu.Unlock()
 	if !ok {
 		conn.Write([]byte(BuildBulkString("").String()))
 		return
@@ -346,7 +380,9 @@ func handleLPopCMD(conn net.Conn, key string, count ...int) {
 	if count == nil {
 		a := list[0]
 
+		listkvMu.Lock()
 		listkv[key] = list[1:]
+		listkvMu.Unlock()
 
 		conn.Write([]byte(BuildBulkString(a).String()))
 		return
@@ -361,7 +397,39 @@ func handleLPopCMD(conn net.Conn, key string, count ...int) {
 		elems = append(elems, list[i])
 	}
 
+	listkvMu.Lock()
 	listkv[key] = list[count[0]:]
+	listkvMu.Unlock()
 
 	writeArray(conn, elems)
+}
+
+func handleBLPopCMD(conn net.Conn, key string, timeout int) {
+	ctx := context.Background()
+	if timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
+		defer cancel()
+	}
+
+	listkvMu.Lock()
+	lval, ok := listkv[key]
+	listkvMu.Unlock()
+	if ok {
+		v := lval[0]
+		listkvMu.Lock()
+		listkv[key] = lval[1:]
+		listkvMu.Unlock()
+		itemInsertedChan <- listItem{val: v, list: key}
+	}
+
+	select {
+	case <-itemInsertedChan:
+		it := <-itemInsertedChan
+		writeArray(conn, []string{it.list, it.val})
+		return
+	case <-ctx.Done():
+		conn.Write([]byte("*-1\r\n"))
+		return
+	}
 }
